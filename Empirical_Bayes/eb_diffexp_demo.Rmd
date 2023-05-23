@@ -1,0 +1,291 @@
+---
+title: "Empirical Bayes Differential Expression Illustration"
+author: "Roland Brown"
+date: "12/21/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Description of Example Data
+To illustrate/compare the methods, we use a [publicly available data](https://github.com/bartongroup/profDGE48) from [Schurch, et. al (2016)](https://rnajournal.cshlp.org/content/22/6/839). The dataset was generated from a simple, two-condition experiment on *Saccharomyces cerevisiae*, a well-studied yeast strain with a small transcriptome.  The wildtype (WT) *S. cerevisiae* strain was compared to a *Δsnf2* mutant.  *SNF2* is the catalytic component of the ATP-dependent chromatin-remodeling SWI/SNF complex in yeast and is required for the positive and negative regulation of expression of many genes. Mutation in SNF2 is known to be accompanied by substantial transcription changes, so many DE genes are expected.  The cleaned and processed RNAseq read count data contained 42 WT and 44 *Δsnf2* biological replicates.  See [Schurch, et. al (2016)](https://rnajournal.cshlp.org/content/22/6/839) for a detailed description of the experimental methods.
+
+
+# Packages and Loading Data
+The following code loads packages and downloads the [processed data](https://github.com/bartongroup/profDGE48/raw/master/Preprocessed_data/), and is adapted from [this example code](https://rdrr.io/github/stephaniehicks/benchmarkfdrData2019/f/inst/scripts/make-data/YeastInSilico/yeast-simulation.Rmd). 
+
+In addition, we remove all genes with zero counts in all samples.
+```{r data, message=FALSE,results="hide",warning=FALSE}
+library(data.table)
+library(tidyr)
+library(dplyr)
+library(readr)
+library(ggplot2)
+library(magrittr)
+library(purrr)
+library(DESeq2)
+library(tibble)
+library(R.utils)
+library(apeglm)
+library(ashr)
+library(edgeR)
+library(ggvenn)
+library(ggpubr)
+
+theme_set(theme_light(base_size=15))
+
+
+baseurl <- "https://github.com/bartongroup/profDGE48/raw/master/"
+
+download.file(url = paste0(baseurl,"Preprocessed_data/Snf2_countdata.tar.gz"),
+              destfile = "Snf2_countdata.tar.gz")
+download.file(url = paste0(baseurl,"Preprocessed_data/WT_countdata.tar.gz"), 
+              destfile = "WT_countdata.tar.gz")
+
+gunzip("Snf2_countdata.tar.gz") 
+gunzip("WT_countdata.tar.gz") 
+
+untar("Snf2_countdata.tar") 
+untar("WT_countdata.tar") 
+
+download.file(url = paste0(baseurl,"Bad_replicate_identification/exclude.lst"), 
+             destfile = "badreps.txt")
+
+files <- dir(pattern = "*.bam.gbgout", full.names = TRUE)
+sample_names <- sapply(strsplit(dir(pattern = "*.bam.gbgout"), "_MID"),
+                       function(x) x[[1]])
+badreps <- read_tsv("badreps.txt", col_names = FALSE)$X1
+badreps <- unlist(lapply(strsplit(badreps, "_MID"), function(x) x[1]))
+
+counts <- files %>%
+  purrr::map(read_tsv, col_names = FALSE) %>% # read in all the files individually
+  purrr::map2(sample_names, ~ dplyr:::rename(.x, !! .y := X2, feature = X1) ) %>% # add sample names
+  purrr::reduce(left_join, by = "feature") %>% # reduce with rbind into one dataframe
+  dplyr::select(-badreps ) %>% # remove badreps 
+  dplyr::filter( rowSums(.[,-1]) > 0 ) # remove all genes with zero counts in all samples
+
+file.remove(files,"badreps.txt","Snf2_countdata.tar","WT_countdata.tar")
+```
+
+# Fitting the Models
+
+## Limma-Voom
+Default settings for Limma-Voom pipeline are used.
+```{r limmafit,message=FALSE,results="hide",warning=FALSE}
+countData <- as.matrix(counts[,-1])
+rownames(countData) <- counts$feature
+nmsSnf2 <- grep("Snf2",colnames(countData),value=T)
+nmsWT <- grep("WT",colnames(countData),value=T)
+
+colData <- data.frame(id=c(nmsSnf2,nmsWT),
+                      type = factor( c(rep("Snf2",length(nmsSnf2)),
+                                       rep("WT",length(nmsWT))),
+                                     levels=c("WT","Snf2"))
+)
+
+des <- model.matrix(~type,colData)
+
+
+limmafit <- voomLmFit(countData,des) %>% 
+              eBayes()
+```
+
+## EdgeR
+The EdgeR analysis used GLM likelihood estimation (rather than the exact test or quasi-likelihood approaches). Otherwise, default settings are used
+```{r edgerfit,message=FALSE,results="hide",warning=FALSE}
+edgerfit <- DGEList(counts=countData, group=colData$type) %>%
+              calcNormFactors() %>%
+              estimateDisp(des) %>%
+              glmFit(des) %>%
+              glmLRT(coef=2)
+
+```
+
+## DESeq2
+Default settings for DESeq2 are used, and all three shrinkage approaches are implemented as well.
+```{r deseqfit,message=FALSE,results="hide",warning=FALSE}
+dds_fit <- DESeqDataSetFromMatrix(countData=countData, 
+                                  colData=colData, 
+                                  design=~type, tidy = FALSE) %>%
+              DESeq() 
+
+deseqfit_unshrunk <- dds_fit %>% results()
+
+deseqfit_apeglm <- lfcShrink(dds=dds_fit,res=deseqfit_unshrunk,
+                             coef="type_Snf2_vs_WT",type="apeglm")
+
+deseqfit_ashr <- lfcShrink(dds=dds_fit,res=deseqfit_unshrunk,
+                           coef="type_Snf2_vs_WT",type="ashr")
+
+deseqfit_normal <- lfcShrink(dds=dds_fit,res=deseqfit_unshrunk,
+                             coef="type_Snf2_vs_WT",type="normal")
+```
+
+## Aggregating Results
+Results are aggregated into a single dataset, with gene, log fold change estimate, and FDR.  All genes found to be DE at an FDR threshold of 0.05 were considered significantly DE.  
+```{r, aggres,message=FALSE,results="hide",warning=FALSE}
+extractDESeqRes <- function(DESeq2Obj,whichmethod)
+{
+  out <- DESeq2Obj %>%
+    data.frame() %>%
+    dplyr::mutate(gene=rownames(.)) %>%
+    dplyr::select(gene,log2FoldChange,padj) %>%
+    setNames(c("gene","log2FC","pAdj")) %>%
+    dplyr::mutate(method=whichmethod)
+  
+  return(out)
+}
+
+extractEdgeRRes <- function(edgerfit)
+{
+  out <- edgerfit %>%
+    topTags(100000,sort.by="none") %$%
+    table %>%
+    data.frame() %>%
+    dplyr::mutate(gene=rownames(.)) %>%
+    dplyr::select(gene,logFC,PValue) %>%
+    setNames(c("gene","log2FC","pAdj")) %>%
+    dplyr::mutate(method="EdgeR")
+  
+  return(out)
+}
+
+extractLimmaRes <- function(limmafit)
+{
+  out <- limmafit %>%
+    topTable(coef=2,sort.by='none',n=100000,adjust.method='BH') %>%
+    dplyr::mutate(gene=rownames(.)) %>%
+    dplyr::select(gene,logFC,adj.P.Val) %>%
+    setNames(c("gene","log2FC","pAdj")) %>%
+    dplyr::mutate(method="limma_voom")
+  
+  return(out)
+}
+
+allres <- rbind(
+  extractDESeqRes(deseqfit_unshrunk,"DESeq2_Unshrunk"),
+  extractDESeqRes(deseqfit_apeglm,"DESeq2_apeglm"),
+  extractDESeqRes(deseqfit_ashr,"DESeq2_ashr"),
+  extractDESeqRes(deseqfit_normal,"DESeq2_normal"),
+  extractEdgeRRes(edgerfit),
+  extractLimmaRes(limmafit)
+) %>%
+  dplyr::mutate(DEgene=ifelse( !is.na(pAdj) & pAdj < 0.05,"yes","no"))
+```
+
+
+# Plots of Results
+Results plots.  Not exhaustive, just those to be included in the manuscript draft.
+
+## DE Genes by Method
+
+### Number of DE Genes
+```{r}
+venndat <- list(
+  EdgeR = allres$gene[allres$method=="EdgeR" & allres$DEgene == "yes"],
+  DESeq2 = allres$gene[allres$method=="DESeq2_Unshrunk" & allres$DEgene == "yes"],
+  LimmaVoom = allres$gene[allres$method=="limma_voom" & allres$DEgene == "yes"]
+)
+
+ndegenes_plt <- sapply(venndat,length) %>% 
+  data.frame %>%
+  setNames("nDEGenes") %>%
+  dplyr::mutate(Method = rownames(.)) %>%
+  
+  ggplot(aes(y=nDEGenes,x=Method,fill=Method,label=nDEGenes)) +
+    geom_bar(stat="identity",alpha=0.5) +
+    geom_text(nudge_y=150) +
+    scale_fill_manual(values=c("#EFC000FF","#0073C2FF",  "#868686FF")) +
+    theme_classic(base_size=15) +
+    theme(legend.position="none") +
+    ylab("# Differentially Expressed Genes") +
+    xlab("")
+
+ndegenes_plt
+```
+
+### Venn Diagram of Overlaps
+```{r, vennoverlap,fig.width=8,fig.height=6}
+
+venn_plt <- ggvenn(
+  venndat, 
+  fill_color = c("#0073C2FF", "#EFC000FF", "#868686FF"),
+  stroke_size = 0.3, set_name_size = 5,show_percentage = T,
+  text_size = 3.5
+  )
+
+venn_plt
+```
+
+
+
+## Fold-Change Shrinkage
+The below is a plot showing ashr fold-change shrinkage in DESeq2 estimates.
+```{r, fcshrinkplot,fig.width=7,fig.height=5}
+
+
+fcshrink_plt <-  allres %>%
+  dplyr::select(gene,method,log2FC) %>%
+  dplyr::filter(method%in%c("DESeq2_ashr","DESeq2_Unshrunk")) %>%
+  pivot_wider(id_cols="gene",names_from="method",values_from="log2FC") %>%
+  
+  ggplot(aes(x=DESeq2_Unshrunk,y=DESeq2_ashr)) +
+    geom_point(alpha=0.1) +
+    geom_hline(yintercept=0,linetype="dashed") +
+    geom_vline(xintercept=0,linetype="dashed") +
+    xlab("Unshrunk Log2 FC Estimate") +
+    ylab("Log2 FC with ashr Shrinkage") +
+    coord_cartesian(xlim=c(-4.5,4),ylim=c(-4.5,4)) +
+    scale_x_continuous(breaks=-4:4,labels=-4:4) +
+    scale_y_continuous(breaks=-4:4,labels=-4:4) 
+
+fcshrink_plt
+    
+```
+
+## Dispersion Borrowing EdgeR
+Plot of empirical Bayes dispersion estimation in EdgeR (genewise, trended, final), for a random subset of genes.
+
+```{r dispshrinkplot,fig.width=7,fig.height=5}
+edger_rawdisp <- DGEList(counts=countData, group=colData$type) %>%
+                    calcNormFactors() %>%
+                    estimateDisp(des,prior.df=0)
+
+dispdat <- data.frame(
+  mean = edger_rawdisp$AveLogCPM,
+  rawdisp = edger_rawdisp$tagwise.dispersion,
+  trenddisp = edger_rawdisp$trended.dispersion,
+  finaldisp = edgerfit$dispersion
+)
+
+set.seed(111)
+dispshrink_plt <- dispdat %>%
+  slice_sample(n=400) %>%
+  ggplot(aes(x=mean)) +
+    geom_point(aes(y=rawdisp),alpha=0.3,size=1) +
+    geom_line(aes(y=trenddisp),col="red",size=1) +
+    geom_segment(aes(xend=mean,y=rawdisp,yend=finaldisp),alpha=0.5) +
+    coord_cartesian(ylim=c(0,2)) +
+    xlab("Avg Log2 Counts Per Million") +
+    ylab("Dispersion") 
+
+dispshrink_plt
+
+
+```
+
+
+## Paper Plots
+```{r,fig.width=11,fig.height=5}
+ggpubr::ggarrange(ndegenes_plt + ggtitle(""),
+                  venn_plt,
+                  ncol=2,labels=c("(a)","(b)"))
+```
+
+```{r,fig.width=10,fig.height=4}
+ggpubr::ggarrange(dispshrink_plt + ggtitle(""),
+                  fcshrink_plt + ggtitle(""),
+                  ncol=2,labels=c("(a)","(b)"))
+```
