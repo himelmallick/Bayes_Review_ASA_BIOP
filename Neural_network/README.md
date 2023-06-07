@@ -2,7 +2,7 @@ BNNs for Tox21
 ==============================
 ### Tatiana Matejovicova, September 2020 ###
 
-Using BNNs to predict toxicity on Tox21 data.
+Using BNNs to predict toxicity on Tox21 data. Upon request, we can provide the entire repository to run the models.
 
 Project Organization
 ------------
