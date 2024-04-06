@@ -13,5 +13,5 @@ Four pharmaceutical/biotechnology companies ([Eli Lilly](https://www.lilly.com/)
 
 # Citation
 
-Paul E et al. (2023+). [A Survey of Bayesian Statistical Methods in Biomarker Discovery and Early Clinical Development](). *Communications in Statistics – Case Studies and Data Analysis*, In Press.
+Paul E et al. (2024). [A Survey of Bayesian Statistical Methods in Biomarker Discovery and Early Clinical Development](https://doi.org/10.1080/23737484.2023.2278112). *Communications in Statistics – Case Studies and Data Analysis*, 10(1):67–93.
 
